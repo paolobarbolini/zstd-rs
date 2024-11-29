@@ -1,8 +1,8 @@
 use alloc::collections::VecDeque;
-use core::{cmp, hint::unreachable_unchecked, mem::MaybeUninit, slice};
+use core::cmp;
 
 pub struct RingBuffer {
-    buf: VecDeque<MaybeUninit<u8>>,
+    buf: VecDeque<u8>,
 }
 
 impl RingBuffer {
@@ -27,9 +27,6 @@ impl RingBuffer {
     pub fn free(&self) -> usize {
         let len = self.buf.len();
         let capacity = self.buf.capacity();
-        if len > capacity {
-            unsafe { unreachable_unchecked() }
-        }
 
         capacity - len
     }
@@ -49,10 +46,6 @@ impl RingBuffer {
         if self.free() < additional {
             self.reserve_amortized(additional);
         }
-
-        if self.free() < additional {
-            unsafe { unreachable_unchecked() }
-        }
     }
 
     #[inline(never)]
@@ -64,23 +57,18 @@ impl RingBuffer {
     #[allow(dead_code)]
     pub fn push_back(&mut self, byte: u8) {
         self.reserve(1);
-        self.buf.push_back(MaybeUninit::new(byte));
+        self.buf.push_back(byte);
     }
 
     /// Fetch the byte stored at the selected index from the buffer, returning it, or
     /// `None` if the index is out of bounds.
     #[allow(dead_code)]
     pub fn get(&self, idx: usize) -> Option<u8> {
-        self.buf
-            .get(idx)
-            .map(|&byte| unsafe { MaybeUninit::assume_init(byte) })
+        self.buf.get(idx).copied()
     }
 
     /// Append the provided data to the end of `self`.
     pub fn extend(&mut self, data: &[u8]) {
-        let len = data.len();
-        let data = data.as_ptr().cast::<MaybeUninit<u8>>();
-        let data = unsafe { slice::from_raw_parts(data, len) };
         self.buf.extend(data);
     }
 
@@ -94,11 +82,7 @@ impl RingBuffer {
 
     /// Return references to each part of the ring buffer.
     pub fn as_slices(&self) -> (&[u8], &[u8]) {
-        let (a, b) = self.buf.as_slices();
-
-        (unsafe { slice_assume_init_ref_polyfill(a) }, unsafe {
-            slice_assume_init_ref_polyfill(b)
-        })
+        self.buf.as_slices()
     }
 
     /// Copies elements from the provided range to the end of the buffer.
@@ -133,10 +117,6 @@ impl RingBuffer {
         debug_assert!(start + len <= self.len());
         debug_assert!(self.free() >= len);
 
-        if self.free() < len {
-            unsafe { unreachable_unchecked() }
-        }
-
         let original_len = self.len();
         let mut intermediate = {
             IntermediateRingBuffer {
@@ -146,10 +126,7 @@ impl RingBuffer {
             }
         };
 
-        intermediate
-            .this
-            .buf
-            .extend((0..len).map(|_| MaybeUninit::uninit()));
+        intermediate.this.buf.extend((0..len).map(|_| 0));
         debug_assert_eq!(intermediate.this.buf.len(), original_len + len);
 
         let (a, b, a_spare, b_spare) = intermediate.as_slices_spare_mut();
@@ -158,7 +135,7 @@ impl RingBuffer {
         let skip = cmp::min(a.len(), start);
         start -= skip;
         let a = &a[skip..];
-        let b = unsafe { b.get_unchecked(start..) };
+        let b = &b[start..];
 
         let mut remaining_copy_len = len;
 
@@ -218,9 +195,7 @@ struct IntermediateRingBuffer<'a> {
 
 impl<'a> IntermediateRingBuffer<'a> {
     // inspired by `Vec::split_at_spare_mut`
-    fn as_slices_spare_mut(
-        &mut self,
-    ) -> (&[u8], &[u8], &mut [MaybeUninit<u8>], &mut [MaybeUninit<u8>]) {
+    fn as_slices_spare_mut(&mut self) -> (&[u8], &[u8], &mut [u8], &mut [u8]) {
         let (a, b) = self.this.buf.as_mut_slices();
         debug_assert!(a.len() + b.len() >= self.original_len);
 
@@ -230,16 +205,11 @@ impl<'a> IntermediateRingBuffer<'a> {
         let b_mid = remaining_init_len;
         debug_assert!(b.len() >= b_mid);
 
-        let (a, a_spare) = unsafe { a.split_at_mut_unchecked(a_mid) };
-        let (b, b_spare) = unsafe { b.split_at_mut_unchecked(b_mid) };
+        let (a, a_spare) = a.split_at_mut(a_mid);
+        let (b, b_spare) = b.split_at_mut(b_mid);
         debug_assert!(a_spare.is_empty() || b.is_empty());
 
-        (
-            unsafe { slice_assume_init_ref_polyfill(a) },
-            unsafe { slice_assume_init_ref_polyfill(b) },
-            a_spare,
-            b_spare,
-        )
+        (a, b, a_spare, b_spare)
     }
 }
 
@@ -266,48 +236,11 @@ impl<'a> Drop for IntermediateRingBuffer<'a> {
 /// The chunk size is not part of the contract and may change depending on the target platform.
 ///
 /// If that isn't possible we just fall back to ptr::copy_nonoverlapping
-fn copy_bytes_overshooting(src: &[u8], dst: &mut [MaybeUninit<u8>], copy_at_least: usize) {
-    // this assert is required for this function to be safe
-    // the optimizer should be able to remove it given how the caller
-    // has somehow to figure out `copy_at_least <= src.len() && copy_at_least <= dst.len()`
-    assert!(src.len() >= copy_at_least && dst.len() >= copy_at_least);
+fn copy_bytes_overshooting(src: &[u8], dst: &mut [u8], copy_at_least: usize) {
+    let src = &src[..copy_at_least];
+    let dst = &mut dst[..copy_at_least];
 
-    type CopyType = usize;
-
-    const COPY_AT_ONCE_SIZE: usize = core::mem::size_of::<CopyType>();
-    let min_buffer_size = usize::min(src.len(), dst.len());
-
-    // this check should be removed by the optimizer thanks to the above assert
-    // if `src.len() >= copy_at_least && dst.len() >= copy_at_least` then `min_buffer_size >= copy_at_least`
-    assert!(min_buffer_size >= copy_at_least);
-
-    // these bounds checks are removed because this is guaranteed:
-    // `min_buffer_size <= src.len() && min_buffer_size <= dst.len()`
-    let src = &src[..min_buffer_size];
-    let dst = &mut dst[..min_buffer_size];
-
-    // Can copy in just one read+write, very common case
-    if min_buffer_size >= COPY_AT_ONCE_SIZE && copy_at_least <= COPY_AT_ONCE_SIZE {
-        let chunk = unsafe { src.as_ptr().cast::<CopyType>().read_unaligned() };
-        unsafe { dst.as_mut_ptr().cast::<CopyType>().write_unaligned(chunk) };
-    } else {
-        unsafe {
-            dst.as_mut_ptr()
-                .cast::<u8>()
-                .copy_from_nonoverlapping(src.as_ptr(), copy_at_least)
-        };
-    }
-
-    debug_assert_eq!(&src[..copy_at_least], unsafe {
-        slice_assume_init_ref_polyfill(&dst[..copy_at_least])
-    });
-}
-
-#[inline(always)]
-unsafe fn slice_assume_init_ref_polyfill(slice: &[MaybeUninit<u8>]) -> &[u8] {
-    let len = slice.len();
-    let data = slice.as_ptr().cast::<u8>();
-    slice::from_raw_parts(data, len)
+    dst.copy_from_slice(src);
 }
 
 #[cfg(test)]
