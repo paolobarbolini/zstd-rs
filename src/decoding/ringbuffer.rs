@@ -1,5 +1,5 @@
-use core::{cmp, hint::unreachable_unchecked, iter, mem::MaybeUninit, slice};
-use std::collections::VecDeque;
+use alloc::collections::VecDeque;
+use core::{cmp, hint::unreachable_unchecked, mem::MaybeUninit, slice};
 
 pub struct RingBuffer {
     buf: VecDeque<MaybeUninit<u8>>,
@@ -80,9 +80,7 @@ impl RingBuffer {
     pub fn extend(&mut self, data: &[u8]) {
         let len = data.len();
         let data = data.as_ptr().cast::<MaybeUninit<u8>>();
-        let data = unsafe {
-            slice::from_raw_parts(data, len)
-        };
+        let data = unsafe { slice::from_raw_parts(data, len) };
         self.buf.extend(data);
     }
 
@@ -160,7 +158,7 @@ impl RingBuffer {
         let skip = cmp::min(a.len(), start);
         start -= skip;
         let a = &a[skip..];
-        let b = &b[start..];
+        let b = unsafe { b.get_unchecked(start..) };
 
         let mut remaining_copy_len = len;
 
@@ -169,7 +167,7 @@ impl RingBuffer {
         copy_bytes_overshooting(a, a_spare, copy_at_least);
         remaining_copy_len -= copy_at_least;
 
-        if remaining_copy_len==0{
+        if remaining_copy_len == 0 {
             intermediate.disarmed = true;
             return;
         }
@@ -182,7 +180,7 @@ impl RingBuffer {
         copy_bytes_overshooting(a, b_spare, copy_at_least);
         remaining_copy_len -= copy_at_least;
 
-        if remaining_copy_len==0{
+        if remaining_copy_len == 0 {
             intermediate.disarmed = true;
             return;
         }
@@ -194,7 +192,7 @@ impl RingBuffer {
         copy_bytes_overshooting(b, a_spare, copy_at_least);
         remaining_copy_len -= copy_at_least;
 
-        if remaining_copy_len==0{
+        if remaining_copy_len == 0 {
             intermediate.disarmed = true;
             return;
         }
@@ -232,8 +230,8 @@ impl<'a> IntermediateRingBuffer<'a> {
         let b_mid = remaining_init_len;
         debug_assert!(b.len() >= b_mid);
 
-        let (a, a_spare) = a.split_at_mut(a_mid);
-        let (b, b_spare) = b.split_at_mut(b_mid);
+        let (a, a_spare) = unsafe { a.split_at_mut_unchecked(a_mid) };
+        let (b, b_spare) = unsafe { b.split_at_mut_unchecked(b_mid) };
         debug_assert!(a_spare.is_empty() || b.is_empty());
 
         (
